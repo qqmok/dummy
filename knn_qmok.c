@@ -1,16 +1,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
-#include <unistd.h>
 #include <math.h>
-#include <errno.h>
-
-#define MAX_QUEUE 100000
-
 
 
 
 /* ========== qmok_login_dll.c ========== */
+/* Double linked list from C-exercises. Author: Qiqi Mok, 2021 */
+
 
 struct list_head {
     struct list_head *next, *prev;
@@ -130,25 +127,7 @@ list_empty(struct list_head *head)
 }
 
 
-
-
 /* ========== end of qmok_login_dll.c ========== */
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -178,16 +157,14 @@ typedef struct {
   struct list_head* neighbors_head;
   int neighbors_counter;
   int* predictions;
-  long neighbor_points_checked;
+  int neighbor_points_checked;
   pthread_mutex_t mutex;
   pthread_cond_t neighbor_cond;
   pthread_cond_t class_cond;
 } test_point_t;
 
 
-
-
-
+// Struct for containing information about k-nn class predictions
 
 typedef struct {
   int k;
@@ -198,7 +175,7 @@ typedef struct {
 } knn_prediction_t;
 
 typedef struct {
-	struct list_head head;
+  struct list_head head;
   void* (*function)(void *);
   void* args;
 } Task;
@@ -215,28 +192,27 @@ typedef struct {
 
 
 typedef struct {
-  pthread_t* threads;
+  int quit;
   int num_threads;
+  pthread_t *threads;
+  struct list_head *task_list;
+  struct list_head *result_list;
+  pthread_mutex_t queue_mutex;
+  pthread_mutex_t result_mutex;
+  pthread_cond_t queue_cond;
+  pthread_cond_t result_cond;
 } thread_pool_t;
 
 
 
-struct list_head *task_list;
-struct list_head *result_list;
 Vector* data;
+test_point_t* test_points;
 long data_size;
 int vector_size, class_size;
 long N;
 int k_max;
 long B;
 int n_threads;
-
-pthread_mutex_t queue_mutex;
-pthread_mutex_t results_mutex;
-pthread_cond_t queue_cond;
-pthread_cond_t results_cond;
-pthread_cond_t queue_full_cond;
-pthread_cond_t results_full_cond;
 
 
 
@@ -309,33 +285,30 @@ print_list(struct list_head *start)
 }
 
 
-#if 1
+
 // compute distance between two test points
 void *compute_distance(void *args) {
   void** pointers = (void**)args;
-  test_point_t* target_point = (test_point_t*) pointers[0];
   test_point_t* test_point = (test_point_t*) pointers[1];
-    
-  if (target_point->block_index != test_point->block_index) { 
-    double distance = 0.0;
-    double* coord_test = test_point->coordinates;
-    double* coord_target = target_point->coordinates;
-    
-    
-    for (int i = 0; i < vector_size; i++) {
-      distance += pow(coord_test[i] - coord_target[i], 2);
-    }
-    neighbor_point_t *new_neighbor = malloc(sizeof(neighbor_point_t));
-    new_neighbor->class = target_point->class;
-    new_neighbor->distance = distance;
-    
-    pthread_mutex_lock(&test_point->mutex);
-    insert_new_neighbor(test_point->neighbors_head, new_neighbor);
-    pthread_mutex_unlock(&test_point->mutex);
-  }
-  
   pthread_mutex_lock(&test_point->mutex);
-  test_point->neighbor_points_checked++;
+  for (int j = 0; j < N; j++) {
+    if (test_points[j].block_index != test_point->block_index) { 
+      double distance = 0.0;
+      double* coord_test = test_point->coordinates;
+      double* coord_target = test_points[j].coordinates;
+    	
+      for (int i = 0; i < vector_size; i++) {
+        distance += pow(coord_test[i] - coord_target[i], 2);
+      }
+      neighbor_point_t *new_neighbor = malloc(sizeof(neighbor_point_t));
+      new_neighbor->class = test_points[j].class;
+      new_neighbor->distance = distance;
+    	
+      insert_new_neighbor(test_point->neighbors_head, new_neighbor);
+      
+    }
+  }
+  test_point->neighbor_points_checked = 1;
   pthread_mutex_unlock(&test_point->mutex);
   pthread_cond_broadcast(&test_point->neighbor_cond);
   
@@ -347,13 +320,12 @@ void *compute_distance(void *args) {
 // predict class for all k for a test point
 void *predict_class(void *args) {
 
-	void** pointers = (void**)args;
+  void** pointers = (void**)args;
   test_point_t* test_point = (test_point_t*) pointers[0];
   pthread_mutex_lock(&test_point->mutex);
-  while (test_point->neighbor_points_checked < N) {
+  while (test_point->neighbor_points_checked < 1) {
     pthread_cond_wait(&test_point->neighbor_cond, &test_point->mutex);
   }
-  pthread_mutex_unlock(&test_point->mutex);
 
 	// predictions for test point
   long class_counter[class_size];
@@ -374,9 +346,9 @@ void *predict_class(void *args) {
       predicted_class = current_neighbor_class;
     }
     (test_point->predictions)[k] = predicted_class;
-  	pthread_mutex_unlock(&test_point->mutex);
-  	pthread_cond_broadcast(&test_point->class_cond);
   }
+  pthread_mutex_unlock(&test_point->mutex);
+  pthread_cond_broadcast(&test_point->class_cond);
   
   free(args);
   
@@ -421,28 +393,26 @@ void *compute_quality(void *args) {
   return NULL;
 }
 
-#if 0
-void execute(Task* task) {
-  void* result = task->function(task->args);
-  return task;
-}
-#endif
 
 void *perform_work(void *args) {
-  while (1) {
+  thread_pool_t *thread_pool = (thread_pool_t*) args;
+  while (thread_pool->quit == 0) {
+    pthread_mutex_lock(&thread_pool->queue_mutex);
+  	while (list_empty(thread_pool->task_list)) {
+  		if (thread_pool->quit == 1) {
+  			pthread_mutex_unlock(&thread_pool->queue_mutex);
+  			return NULL;
+  		}
+  		pthread_cond_wait(&thread_pool->queue_cond, &thread_pool->queue_mutex);
+  	}
     Task *task;
-    pthread_mutex_lock(&queue_mutex);
-    while (list_empty(task_list)) {
-      pthread_cond_wait(&queue_cond, &queue_mutex);
-    }
-    task = (Task*) list_del(task_list->next);
-    pthread_mutex_unlock(&queue_mutex);
-    pthread_cond_signal(&queue_full_cond);
+    task = (Task*) list_del((thread_pool->task_list)->next);
+    pthread_mutex_unlock(&thread_pool->queue_mutex);
     task->function(task->args);
-    pthread_mutex_lock(&results_mutex);
-    list_add_tail((struct list_head*) task, result_list);
-    pthread_mutex_unlock(&results_mutex);
-    pthread_cond_signal(&results_cond);
+    pthread_mutex_lock(&thread_pool->result_mutex);
+    list_add_tail((struct list_head*) task, thread_pool->result_list);
+    pthread_mutex_unlock(&thread_pool->result_mutex);
+    pthread_cond_signal(&thread_pool->result_cond);
   }
   return NULL;
 }
@@ -453,43 +423,51 @@ void thread_pool_enqueue(thread_pool_t* thread_pool, void *(*function) (void *),
   new_task->function = function;
   new_task->args = args;
   
-  pthread_mutex_lock(&queue_mutex);
-  list_add_tail((struct list_head*) new_task, task_list);
-  pthread_mutex_unlock(&queue_mutex);
-  pthread_cond_signal(&queue_cond);
+  pthread_mutex_lock(&thread_pool->queue_mutex);
+  list_add_tail((struct list_head*) new_task, thread_pool->task_list);
+  pthread_mutex_unlock(&thread_pool->queue_mutex);
+  pthread_cond_signal(&thread_pool->queue_cond);
 }
 
 void thread_pool_init(thread_pool_t* thread_pool, int count) {
-  pthread_t new_threads[count];
+  thread_pool->task_list = malloc(sizeof(struct list_head));
+  list_init(thread_pool->task_list);
+  thread_pool->result_list = malloc(sizeof(struct list_head));
+  list_init(thread_pool->result_list);
+  thread_pool->queue_mutex = (pthread_mutex_t) PTHREAD_MUTEX_INITIALIZER;
+  thread_pool->queue_cond = (pthread_cond_t) PTHREAD_COND_INITIALIZER;
+  thread_pool->result_mutex = (pthread_mutex_t) PTHREAD_MUTEX_INITIALIZER;
+  thread_pool->result_cond = (pthread_cond_t) PTHREAD_COND_INITIALIZER;
+  
+  thread_pool->threads = malloc(sizeof(pthread_t) * count);
+  thread_pool->num_threads = count;
   for (int i = 0; i < count; i++) {
-    int index = i;
-    if (pthread_create(&new_threads[i], NULL, perform_work, &index) != 0) {
+    if (pthread_create(&thread_pool->threads[i], NULL, perform_work, thread_pool) != 0) {
       puts("Creating thread failed");
     }
   }
-  thread_pool->threads = new_threads;
-  thread_pool->num_threads = count;
 }
 
 Task* thread_pool_wait(thread_pool_t* thread_pool) {
-  pthread_mutex_lock(&results_mutex);
-  while (list_empty(result_list)) {
-    pthread_cond_wait(&results_cond, &results_mutex);
+  pthread_mutex_lock(&thread_pool->result_mutex);
+  while (list_empty(thread_pool->result_list)) {
+    pthread_cond_wait(&thread_pool->result_cond, &thread_pool->result_mutex);
   }
-  Task *result = (Task*) list_del(result_list->next);
-  pthread_mutex_unlock(&results_mutex);
+  Task *result = (Task*) list_del((thread_pool->result_list)->next);
+  pthread_mutex_unlock(&thread_pool->result_mutex);
   return result;
 }
 
 
 void thread_pool_shutdown(thread_pool_t* thread_pool) {
+  thread_pool->quit = 1;
+  pthread_cond_broadcast(&thread_pool->queue_cond);
   for (int i = 0; i < thread_pool->num_threads; i++) {
-    int s = pthread_cancel(thread_pool->threads[i]);
+    pthread_join(thread_pool->threads[i], NULL);
   }
   free(thread_pool);
 }
 
-#endif
 
 void sequential(test_point_t* data) {
   long scores[k_max];
@@ -533,8 +511,8 @@ void sequential(test_point_t* data) {
       class_counter[current_neighbor_class]++;
       current_neighbor = current_neighbor->next;
       if ((class_counter[current_neighbor_class] == predicted_class_counter && current_neighbor_class > predicted_class) 
-      		|| class_counter[current_neighbor_class] > predicted_class_counter) {
-      	predicted_class_counter = class_counter[current_neighbor_class];
+      	   || class_counter[current_neighbor_class] > predicted_class_counter) {
+        predicted_class_counter = class_counter[current_neighbor_class];
         predicted_class = current_neighbor_class;
       }
       
@@ -566,7 +544,7 @@ void sequential(test_point_t* data) {
 int main(int argc, char* argv[]) {
 
   if (argc != 6) {
-    puts("wrong format");
+    puts("Please enter valid arguments.");
     return 0;
   }
 
@@ -579,22 +557,18 @@ int main(int argc, char* argv[]) {
   FILE * fp = fopen(filename, "r");
   
   if (fscanf(fp, "%ld %d %d\n", &data_size, &vector_size, &class_size) == 0) {
-    puts("wrong txt");
+    puts("Error occured while reading txt file.");
     return 0;
+  }
+  
+  if (B < 2 || B > N) {
+  	puts("B should be >1 and <N.");
   }
   
   if (data_size < N) {
     puts("The dataset size is smaller than N.");
     return 0;
   }
-  
-  
-  task_list = malloc(sizeof(struct list_head));
-  result_list = malloc(sizeof(struct list_head));
-  list_init(task_list);
-  list_init(result_list);
-  
-  
   
   // load data from file
   
@@ -605,20 +579,23 @@ int main(int argc, char* argv[]) {
     data[i].coordinates = malloc(sizeof(double) * vector_size);
     for (int j = 0; j < vector_size; j++) {
       if (fscanf(fp, "%lf ", &data[i].coordinates[j]) == 0) {
-        puts("error file coord");
+        puts("Error occured while reading coordinates.");
         return 1;
       }
     }
     if (fscanf(fp, "%d\n", &data[i].class) == 0) {
-      puts("error file class");
+      puts("Error occured while reading class.");
       return 1;
     }
   }
   
-  
+  if (fclose(fp) != 0) {
+    puts("Failed closing file.");
+    return 1;
+  }
   
   long block_size = N / B;
-  test_point_t* test_points = malloc(sizeof(test_point_t) * N);
+  test_points = malloc(sizeof(test_point_t) * N);
   
   for (long i = 0; i < N; i++) {
     pthread_mutex_t new_mutex;
@@ -648,7 +625,6 @@ int main(int argc, char* argv[]) {
     test_points[i] = new_point;
   } 
  
-  puts("loading data completed");
  
  
   knn_prediction_t predictions[k_max];
@@ -666,60 +642,16 @@ int main(int argc, char* argv[]) {
     };
     predictions[i] = new_prediction;
   }
-  puts("creating knns completed");
- 
-#if 0  
-  for (long i = 0; i < B; i++) {
-    for (long j = 0; j < block_size; j++) {
-      neighbor_point_t* new_neighbors = malloc(sizeof(neighbor_point_t) * k_max);
-      for (int k = 0; k < k_max; k++) {
-        new_neighbors[k].index = -1;
-        new_neighbors[k].distance = -1.0;
-      }
-      
-      if (i == B-1) {
-        new_point.block_end = N-1;
-      }
-      test_points[i*block_size + j] = new_point;
-    }
-  }
-  for (long i = B * block_size; i < N; i++) {
-    neighbor_point_t* new_neighbors = malloc(sizeof(neighbor_point_t) * k_max);
-    for (int k = 0; k < k_max; k++) {
-      new_neighbors[k].index = -1;
-      new_neighbors[k].distance = -1.0;
-    }
-    pthread_mutex_t new_mutex;
-    pthread_mutex_init(&new_mutex, NULL);
-    pthread_cond_t new_cond;
-    pthread_cond_init(&new_cond, NULL);
-    test_point_t new_point = {
-      .index = i,
-      .block_start = (long) (B-1) * block_size,
-      .block_end = (long) N-1,
-      .coordinates = data[i].coordinates,
-      .neighbors = new_neighbors,
-      .neighbor_points_checked = 0,
-      .mutex = new_mutex,
-      .cond = new_cond
-    };  
-    
-  }
-#endif
-
+  
+  
   if (n_threads == 0) {
     sequential(test_points);
   }
 
-#if 1
+
   else if (n_threads > 0) {
-    pthread_mutex_init(&queue_mutex, NULL);
-    pthread_mutex_init(&results_mutex, NULL);
-    pthread_cond_init(&queue_cond, NULL);
-    pthread_cond_init(&results_cond, NULL);
-    pthread_cond_init(&queue_full_cond, NULL);
-    pthread_cond_init(&results_full_cond, NULL);
   
+    // create and initialize thread pool
     thread_pool_t* thread_pool;
     thread_pool = malloc(sizeof(thread_pool_t));
     thread_pool_init(thread_pool, n_threads);
@@ -727,21 +659,16 @@ int main(int argc, char* argv[]) {
     
     
     // part 1
- 		puts("part 1");
     for (long i = 0; i < N; i++) {
-      for (long j = 0; j < N; j++) {
-        void** args = malloc(sizeof(void*) * 2);
-        args[0] = (void*) &test_points[j];
-        args[1] = (void*) &test_points[i];
-        thread_pool_enqueue(thread_pool, compute_distance, args);
-        // free(thread_pool_wait(thread_pool));
-      }
+    	void** args = malloc(sizeof(void*) * 2);
+      args[0] = (void*) &test_points;
+      args[1] = (void*) &test_points[i];
+      thread_pool_enqueue(thread_pool, compute_distance, args);
+      // free(thread_pool_wait(thread_pool));
     }
 
   
     // part 2
-    puts("part 2");
-    
     for (int k = 0; k < k_max; k++) {
       for (int i = 0; i < N; i++) {
         void** args = malloc(sizeof(void*) * 2);
@@ -753,8 +680,7 @@ int main(int argc, char* argv[]) {
     }
 
 
-  // part 3
-    puts("part 3");
+    // part 3
     for (int k = 0; k < k_max; k++) {
       for (int i = 0; i < N; i++) {
         void** args = malloc(sizeof(void*) * 2);
@@ -775,9 +701,12 @@ int main(int argc, char* argv[]) {
       // free(thread_pool_wait(thread_pool));
     }
   	
-  	while(!list_empty(task_list)) {
-  		free(thread_pool_wait(thread_pool));
-  	}
+
+    while(!list_empty(thread_pool->task_list)) {
+      free(thread_pool_wait(thread_pool));
+    }
+    
+
     int result_k = -1;
     double result_score = 0.0;
     for(int k = 0; k < k_max; k++) {
@@ -789,17 +718,12 @@ int main(int argc, char* argv[]) {
     }
     printf("%d\n", result_k);
   	
-  	puts("shutdown");
-    // thread_pool_shutdown(thread_pool);
-    free(thread_pool);
+
+    thread_pool_shutdown(thread_pool);
     
   
   }
   
-#endif  
-  if (fclose(fp) != 0) {
-    puts("Failed closing file.");
-  }
   
   free_test_points(test_points);
   
